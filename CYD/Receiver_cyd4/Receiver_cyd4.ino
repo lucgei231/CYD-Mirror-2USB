@@ -1,5 +1,5 @@
 /*
- * Pixel Update Receiver for CYD2USB 2.8" ESP32-2432S028R (ILI9341 240x320 portrait)
+ * Pixel Update Receiver for CYD2USB 2.8" ESP32-2432S028R (ILI9341 320x240 landscape)
  *
  * Protocol (little-endian):
  *
@@ -17,6 +17,29 @@
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <esp_heap_caps.h>
+#include <XPT2046_Touchscreen.h>
+
+// XPT2046 touchscreen (wired to its own SPI pins on the CYD2USB).
+// Mirrors the working Surrey-Homeware/Aura config: touch on VSPI
+// (the TFT runs on HSPI), with the IRQ pin used for touch detection.
+#define XPT_MOSI 32
+#define XPT_MISO 39
+#define XPT_CLK  25
+#define XPT_CS   33
+#define XPT_IRQ  36
+
+SPIClass touchscreenSPI = SPIClass(VSPI);
+XPT2046_Touchscreen touchscreen(XPT_CS, XPT_IRQ);
+
+// Raw ranges from the Aura project (known-good for this board, landscape 320x240)
+#define XPT_RAW_X_MIN 240
+#define XPT_RAW_X_MAX 3800
+#define XPT_RAW_Y_MIN 3895  // raw Y at the top edge (axis is inverted)
+#define XPT_RAW_Y_MAX 395   // raw Y at the bottom edge
+
+// Flip if taps land mirrored (both flipped: portrait->landscape is CCW, not CW)
+#define TOUCH_MIRROR_X true
+#define TOUCH_MIRROR_Y true
 
 #define TFT_MADCTL     0x36
 #define TFT_MADCTL_RGB 0x00
@@ -24,8 +47,8 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-#define DISPLAY_WIDTH  240
-#define DISPLAY_HEIGHT 320
+#define DISPLAY_WIDTH  320
+#define DISPLAY_HEIGHT 240
 
 #ifndef TFT_BL
 #define TFT_BL 21
@@ -47,6 +70,16 @@ const uint8_t MAGIC_RUN[4]   = {'P', 'X', 'U', 'R'};
 const uint8_t RUN_VERSION     = 0x01;
 const size_t  RUN_HEADER_SIZE = 11;
 
+// Touch event packet sent CYD -> PC: 'TOUC' + version(1) + state(1) + x(2) + y(2) = 10 bytes
+// state: 1 = pressed, 2 = moved while pressed, 0 = released
+const uint8_t MAGIC_TOUCH[4] = {'T', 'O', 'U', 'C'};
+const uint8_t TOUCH_VERSION  = 0x01;
+
+// Button packet sent CYD -> PC: 'BUTN' + version(1) + state(1) + pad(2) = 8 bytes
+const uint8_t MAGIC_BTN[4] = {'B', 'U', 'T', 'N'};
+const uint8_t BTN_VERSION  = 0x01;
+#define BTN_PIN 0  // BOOT button (to GND, use INPUT_PULLUP)
+
 bool swapBytesSetting = false;
 bool useBgrSetting    = true;  // CYD2USB 2.8" ILI9341 panel is BGR
 
@@ -65,6 +98,94 @@ struct PixelUpdate {
 PixelUpdate* updateBuffer   = nullptr;
 uint32_t     bufferCapacity = 0;
 bool         dmaEnabled     = false;
+
+uint16_t lastTouchX = 0, lastTouchY = 0;
+bool     touchWasPressed = false;
+uint32_t lastTouchPoll = 0;
+uint32_t lastMovePrint = 0;
+bool     btnWasPressed = false;
+
+void sendButtonEvent(uint8_t state) {
+  if (!client || !client.connected()) return;
+  uint8_t pkt[8];
+  memcpy(pkt, MAGIC_BTN, 4);
+  pkt[4] = BTN_VERSION;
+  pkt[5] = state;  // 1 = pressed, 0 = released
+  pkt[6] = 0;
+  pkt[7] = 0;
+  client.write(pkt, sizeof(pkt));
+}
+
+void pollButton() {
+  bool pressed = (digitalRead(BTN_PIN) == LOW);
+  if (pressed != btnWasPressed) {
+    delay(25);  // debounce
+    pressed = (digitalRead(BTN_PIN) == LOW);
+    if (pressed != btnWasPressed) {
+      btnWasPressed = pressed;
+      Serial.printf("Button %s\n", pressed ? "pressed" : "released");
+      sendButtonEvent(pressed ? 1 : 0);
+    }
+  }
+}
+
+void sendTouchEvent(uint8_t state, uint16_t x, uint16_t y) {
+  if (!client || !client.connected()) return;
+  uint8_t pkt[10];
+  memcpy(pkt, MAGIC_TOUCH, 4);
+  pkt[4] = TOUCH_VERSION;
+  pkt[5] = state;  // 1 = pressed, 0 = released
+  pkt[6] = x & 0xFF;        pkt[7] = (x >> 8) & 0xFF;
+  pkt[8] = y & 0xFF;        pkt[9] = (y >> 8) & 0xFF;
+  client.write(pkt, sizeof(pkt));
+}
+
+void pollTouch() {
+  // Same gating as the working Aura sketch: IRQ fired AND real pressure
+  if (!(touchscreen.tirqTouched() && touchscreen.touched())) {
+    if (touchWasPressed) {
+      touchWasPressed = false;
+      Serial.printf("Touch up (%u, %u)\n", lastTouchX, lastTouchY);
+      sendTouchEvent(0, lastTouchX, lastTouchY);
+    }
+    return;
+  }
+  TS_Point p = touchscreen.getPoint();
+  // Phantom-touch filter: a dead/floaty bus reads exactly (0, 0) — ignore it
+  if (p.x == 0 && p.y == 0) {
+    if (touchWasPressed) {
+      touchWasPressed = false;
+      sendTouchEvent(0, lastTouchX, lastTouchY);
+    }
+    return;
+  }
+  int16_t dx = map(p.x, XPT_RAW_X_MIN, XPT_RAW_X_MAX, DISPLAY_WIDTH - 1, 0);
+  int16_t dy = map(p.y, XPT_RAW_Y_MIN, XPT_RAW_Y_MAX, 0, DISPLAY_HEIGHT - 1);
+  if (TOUCH_MIRROR_X) dx = DISPLAY_WIDTH  - 1 - dx;
+  if (TOUCH_MIRROR_Y) dy = DISPLAY_HEIGHT - 1 - dy;
+  if (dx < 0) dx = 0;
+  if (dx >= DISPLAY_WIDTH)  dx = DISPLAY_WIDTH - 1;
+  if (dy < 0) dy = 0;
+  if (dy >= DISPLAY_HEIGHT) dy = DISPLAY_HEIGHT - 1;
+
+  int16_t prevX = lastTouchX;
+  int16_t prevY = lastTouchY;
+  lastTouchX = dx;
+  lastTouchY = dy;
+
+  if (!touchWasPressed) {
+    Serial.printf("Touch down (%u, %u)  raw=(%d, %d) z=%d\n", dx, dy, p.x, p.y, p.z);
+    sendTouchEvent(1, dx, dy);
+    touchWasPressed = true;
+  } else if (abs(dx - prevX) + abs(dy - prevY) >= 2) {
+    // Finger moved while pressed: send a move event (deadband filters noise)
+    sendTouchEvent(2, dx, dy);
+    if (millis() - lastMovePrint > 1000) {
+      lastMovePrint = millis();
+      Serial.printf("Move (%u, %u)\n", dx, dy);
+    }
+  }
+}
 
 bool ensureUpdateBuffer(uint32_t needed) {
   if (needed <= bufferCapacity && updateBuffer != nullptr) return true;
@@ -87,10 +208,18 @@ bool readExactly(WiFiClient& c, uint8_t* dst, size_t len) {
   return got == len;
 }
 
+// Uncomment if the image appears horizontally mirrored
+//#define TFT_MIRROR_MX
+
 void applyColorConfig() {
   tft.setSwapBytes(swapBytesSetting);
+  // Landscape (rotation 1) MADCTL for ILI9341: MV + color order (+ optional MX mirror)
+  uint8_t mad = 0x20 | (useBgrSetting ? TFT_MADCTL_BGR : TFT_MADCTL_RGB);
+#ifdef TFT_MIRROR_MX
+  mad |= 0x40;
+#endif
   tft.writecommand(TFT_MADCTL);
-  tft.writedata((useBgrSetting ? TFT_MADCTL_BGR : TFT_MADCTL_RGB) | 0x40);
+  tft.writedata(mad);
 }
 
 void showWaitingScreen() {
@@ -123,9 +252,17 @@ void setup() {
   tft.init();
   SPI.setFrequency(SPI_TARGET_FREQ);
   dmaEnabled = tft.initDMA();
-  tft.setRotation(0);
+  tft.setRotation(1);  // landscape 320x240
   applyColorConfig();
   tft.fillScreen(TFT_BLACK);
+
+  // Touch — start the bus on the touch pins BEFORE begin(): the library's
+  // internal begin() would otherwise leave the bus on the default pins.
+  touchscreenSPI.begin(XPT_CLK, XPT_MISO, XPT_MOSI, XPT_CS);
+  touchscreen.begin(touchscreenSPI);
+
+  // BOOT button (GPIO 0) — hold while touching to pan the view
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
@@ -292,5 +429,10 @@ void loop() {
     Serial.println("Client disconnected");
     showWaitingScreen();
   }
+  if (millis() - lastTouchPoll >= 30) {
+    lastTouchPoll = millis();
+    pollTouch();
+  }
+  pollButton();
   delay(1);
 }
